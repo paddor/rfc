@@ -6,7 +6,9 @@ status: Draft
 editor: Patrik Wenger <paddor@gmail.com>
 ---
 
-This document specifies `lz4+tcp://`, an LZ4-compressed variant of the ZMTP 3.1 transport.
+This document specifies `lz4+tcp://` and `lz4+ws://`, LZ4-compressed
+transports for ZMTP 3.1 and ZWS. Revision 2 adds bounded arenas of complete
+messages.
 
 ## Preamble
 
@@ -16,21 +18,28 @@ This Specification is free software; you can redistribute it and/or modify it un
 
 This Specification is a [free and open standard](http://www.digistan.org/open-standard:definition) and is governed by the Digital Standards Organization's [Consensus-Oriented Specification System](http://www.digistan.org/spec:1/COSS).
 
-The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](http://tools.ietf.org/html/rfc2119).
-
 ## 1. Abstract
 
 This document specifies `lz4+tcp://`, an LZ4-compressed variant of the
-ZMTP 3.1 transport. After a plain-TCP handshake, every post-handshake
-ZMTP message part is framed with a 4-byte sentinel and compressed with
-the LZ4 block algorithm (no entropy stage). An optional dictionary
+ZMTP 3.1 transport. After a plain-TCP handshake, data uses sentinel-framed
+parts or bounded arenas containing several complete messages, with optional
+LZ4 block compression. An optional dictionary
 (user-supplied or automatically trained) is shipped in-band exactly once
-per direction per connection.
+per direction per connection. `lz4+ws://` applies the same transform over
+ZWS.
 
 
-## 2. Motivation
+## 2. Language
 
-### 2.1 Why a transport scheme
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+document are to be interpreted as described in
+[RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119).
+
+
+## 3. Motivation
+
+### 3.1 Why a transport scheme
 
 Compression as a transport scheme (`lz4+tcp://` vs. `tcp://`) rather
 than a socket option: the decision is in the endpoint URI, so the
@@ -42,7 +51,7 @@ to a `tcp://` peer. The handshake succeeds, but the first
 post-handshake part fails sentinel dispatch and the connection
 closes.
 
-### 2.2 Why not negotiate compression
+### 3.2 Why not negotiate compression
 
 A single scheme committed by both sides is simpler than any
 in-protocol negotiation. Negotiation introduces per-connection
@@ -51,7 +60,7 @@ timing-based side channel for probing whether a peer speaks the
 compressed variant. The scheme-is-the-contract model avoids all of
 that.
 
-### 2.3 Why LZ4 block format, not frame
+### 3.3 Why LZ4 block format, not frame
 
 Frame format (magic `04 22 4D 18`, with header + end-mark + optional
 checksum) is meant for standalone interoperable files. Over a
@@ -63,31 +72,31 @@ bytes of envelope per part, avoids a redundant content checksum
 encoder/decoder allocation footprint small.
 
 
-## 3. Goals and Non-goals
+## 4. Goals and Non-goals
 
-### 3.1 Goals
+### 4.1 Goals
 
 - Transparent compression: any ZMTP message part that works over
   plain `tcp://` works over `lz4+tcp://`, with no size limit.
-- Per-part LZ4 block-format compression, independently decodable.
+- Independently decodable parts or arenas of complete messages.
 - Optional dictionary (user-supplied or auto-trained), shipped in-band
   exactly once per direction per connection, capped at 8 KiB.
-- Pass-through for parts where compression does not save >= 8 bytes.
+- Raw encoding when compression does not reduce the envelope size.
 - Bounded decompression: every decoder invocation is capped by a
   caller-supplied or socket-level `max_message_size`.
-- Sentinel-dispatched receiver: four legal sentinels, all others
+- Sentinel-dispatched receiver: five legal sentinels, all others
   close the connection.
 - No negotiation state, no mixed-mode per-connection.
 
-### 3.2 Non-goals
+### 4.2 Non-goals
 
 - LZ4 frame-format interoperability. Wire bytes intentionally do not
   match any standard LZ4 tool; the sentinels (`LZ4B`, `LZ4M`, `LZ4D`)
   are ASCII-encoded and not in any defined LZ4 magic-number range.
 - Custom dictionary training algorithms. The built-in COVER trainer
   is sufficient; pluggable trainers are not a goal.
-- Streaming / context-takeover compression. Each part is
-  independently decodable from its own LZ4B envelope.
+- Streaming / context-takeover compression. Parts and arenas have no
+  compression history beyond the direction's immutable dictionary.
 - Multiple dict rotation on one connection. A connection gets at most
   one dict per direction; to rotate, close and reopen. The same dict
   bytes MAY be reused across many connections.
@@ -95,21 +104,22 @@ encoder/decoder allocation footprint small.
   plain `ipc://` or `inproc://`; inproc is zero-copy.
 
 
-## 4. Terminology
+## 5. Terminology
 
 | Term     | Meaning                                                                      |
 |----------|------------------------------------------------------------------------------|
-| Sentinel | First 4 bytes of each wire part, selecting which of three formats follows.   |
+| Sentinel | First 4 bytes of each wire part, selecting its encoding. |
+| Arena | Bounded concatenation of complete ZMTP data messages, compressed together. |
 | Dict     | User-supplied or trained byte string, 1-8192 bytes. Shipment and receive-side install are tracked per direction per connection; the same dict bytes MAY be shared by many connections. |
 | Envelope | The sentinel + any fixed header bytes that precede the payload or ciphertext. |
 | Budget   | The socket's `max_message_size`, enforced by the receiver as a cap on the total decompressed size summed across all parts of a single ZMTP message (MORE-flag-chained). |
 
 
-## 5. Part Encoding
+## 6. Part Encoding
 
-### 5.1 Sentinel dispatch
+### 6.1 Sentinel dispatch
 
-Every wire part begins with one of four 4-byte sentinels:
+Every wire part begins with one of five 4-byte sentinels:
 
 | Sentinel (hex) | ASCII  | Meaning                     |
 |----------------|--------|-----------------------------|
@@ -117,11 +127,12 @@ Every wire part begins with one of four 4-byte sentinels:
 | `4C 5A 34 42`  | `LZ4B` | LZ4-compressed single block |
 | `4C 5A 34 4D`  | `LZ4M` | LZ4-compressed multi-block  |
 | `4C 5A 34 44`  | `LZ4D` | Dictionary shipment         |
+| `4C 5A 34 41`  | `LZ4A` | Arena of complete messages  |
 
 Any other leading 4 bytes MUST cause the receiver to close the
 connection.
 
-### 5.2 Uncompressed part (`00 00 00 00`)
+### 6.2 Uncompressed part (`00 00 00 00`)
 
 ```
 +------------------+-------------------+
@@ -132,7 +143,7 @@ connection.
 
 Length is implicit from the ZMTP frame size: `N = frame_size - 4`.
 
-### 5.3 LZ4-compressed single-block part (`LZ4B`)
+### 6.3 LZ4-compressed single-block part (`LZ4B`)
 
 ```
 +--------------+--------------------------+------------------+
@@ -150,9 +161,9 @@ Length is implicit from the ZMTP frame size: `N = frame_size - 4`.
   descriptor, no end-mark, no checksum.
 - `decompressed_size` MUST NOT exceed `LZ4M_BLOCK_SIZE`
   (1,073,741,824). Parts larger than this MUST use the LZ4M
-  multi-block encoding (Sec. 5.4).
+  multi-block encoding (Sec. 6.4).
 
-### 5.4 LZ4-compressed multi-block part (`LZ4M`)
+### 6.4 LZ4-compressed multi-block part (`LZ4M`)
 
 ```
 +--------------+--------------------------+-----+-----+-----+-----+
@@ -178,7 +189,7 @@ Each block is a `(u32 LE compressed_block_len, LZ4 block bytes)` pair:
   value is a protocol constant chosen to stay well within the LZ4
   block API's `i32` parameter limit.
 
-### 5.5 Sender rules
+### 6.5 Sender rules
 
 1. Choose a per-part `min_size`. The RECOMMENDED conservative value is
    128 bytes if a dictionary is installed on this connection's send
@@ -188,7 +199,7 @@ Each block is a `(u32 LE compressed_block_len, LZ4 block bytes)` pair:
 2. If `plaintext.size < min_size`: emit
    `00 00 00 00 | plaintext`.
 3. If `plaintext.size > LZ4M_BLOCK_SIZE`: use multi-block encoding
-   (Sec. 5.6).
+   (Sec. 6.6).
 4. Otherwise compress the plaintext against the installed dict (or
    no dict). If
    `compressed.size + 12 >= plaintext.size + 4`
@@ -201,7 +212,7 @@ If the plaintext's leading 4 bytes happen to match a reserved
 sentinel and the sender elected passthrough, the `00 00 00 00`
 prefix already disambiguates at the receiver.
 
-### 5.6 Multi-block sender rules
+### 6.6 Multi-block sender rules
 
 When `plaintext.size > LZ4M_BLOCK_SIZE`:
 
@@ -217,12 +228,12 @@ always compresses. (Parts this large benefit from compression even
 at a modest ratio; the passthrough threshold is designed for small
 messages where the 12-byte envelope overhead dominates.)
 
-### 5.7 Receiver rules
+### 6.7 Receiver rules
 
 1. Read 4-byte sentinel. If the part is shorter than 4 bytes, close
    the connection.
 2. `00 00 00 00`: check remaining byte count against the budget
-   (Sec. 7); return the remaining `N - 4` bytes as plaintext.
+   (Sec. 8); return the remaining `N - 4` bytes as plaintext.
 3. `LZ4B`:
    - If the part is shorter than 12 bytes, close the connection
      (no room for the size field).
@@ -257,13 +268,70 @@ messages where the 12-byte envelope overhead dominates.)
      equal `decompressed_size`, or there are leftover bytes after
      the last block, close the connection.
    - Return plaintext.
-5. `LZ4D`: see Sec. 6.
-6. Any other sentinel: close the connection.
+5. `LZ4D`: see Sec. 7.
+6. `LZ4A`: see Sec. 6.8.
+7. Any other sentinel: close the connection.
+
+### 6.8 Arena (`LZ4A`)
+
+An arena is one single-part, non-command outer ZMTP message:
+
+```
+LZ4A | mode u8 | reserved[3] | decoded_size u32 LE | messages u32 LE | data
+```
+
+The header is 16 bytes. `mode = 0` carries raw arena bytes; `mode = 1`
+carries one LZ4 block, using the installed dictionary if present.
+Reserved bytes MUST be zero; other modes MUST close the connection.
+
+Decoded data concatenates ordinary ZMTP data frames: flags, short or long
+length, then payload. MORE chains parts of one logical message; a clear
+MORE ends that message. Commands, reserved flag bits, incomplete headers,
+truncated bodies, unfinished multipart messages, and trailing bytes are
+invalid. Payloads are application bytes, with no inner compression sentinels.
+
+Protocol limits, checked before decompression:
+
+- `1 <= decoded_size <= 65536` bytes, including inner frame headers.
+- `1 <= messages <= 256`.
+- The outer payload MUST NOT exceed 65552 bytes, including its header.
+- Raw data length MUST equal `decoded_size`; compressed data MUST decode
+  to exactly that length, with no unused compressed input.
+
+The receiver MUST validate the complete decoded arena before exposing any
+message. It MUST contain exactly `messages` complete messages and at most
+4096 parts total. Apply `max_message_size` separately to each logical
+message, including the implementation's per-part storage charge; the arena
+size is a separate bound, never one application's message budget.
+
+Receivers MAY retain one decoded arena and deliver it incrementally.
+Delivery MUST preserve message order, message-level HWM/rate accounting,
+and fair scheduling. Backpressure MUST retain the unread suffix. An arena
+is transport overhead and MUST NOT appear as an application message.
+
+### 6.9 Arena sender rules
+
+Senders MAY batch already queued small messages. They MUST bound both
+bytes and message count and MUST NOT wait for additional messages to fill
+an arena. The recommended target is 16 KiB of decoded frame bytes;
+isolated or larger messages MAY use the existing per-part encodings.
+
+Apply the compression threshold to the whole arena. Use mode 0 below
+threshold or when the compressed block is no smaller than the raw arena.
+Each arena is independent of earlier arenas. A dictionary shipment MUST
+precede any arena that uses it; dictionary changes cannot occur inside
+an arena. Training MAY sample logical messages before encoding the arena.
+
+Fan-out senders MUST filter and admit logical messages before sharing an
+arena. Recipients sharing compressed bytes MUST receive the same message
+sequence and dictionary. Limited credit or message-level eviction MAY
+require smaller arenas or per-message encoding; batching MUST NOT change
+the socket's drop policy or allow a slow peer to starve ready peers.
 
 
-## 6. Dictionary Shipment
+## 7. Dictionary Shipment
 
-### 6.1 Dictionary message format
+### 7.1 Dictionary message format
 
 ```
 +--------------+---------------------------+
@@ -272,7 +340,7 @@ messages where the 12-byte envelope overhead dominates.)
 +--------------+---------------------------+
 ```
 
-### 6.2 Constraints
+### 7.2 Constraints
 
 - A dictionary shipment MUST be a single-part ZMTP message. The
   MORE flag MUST be clear on the sole frame. A receiver MUST close
@@ -280,21 +348,21 @@ messages where the 12-byte envelope overhead dominates.)
   in a multi-part message.
 - `D` MUST satisfy `1 <= D <= 8192`. `D = 0` or `D > 8192`: close
   the connection.
-- A shipment MUST be sent BEFORE any LZ4B or LZ4M part that relies on
+- A shipment MUST be sent BEFORE any LZ4B, LZ4M, or LZ4A part that relies on
   the dict.
 - A shipment MUST be sent AT MOST ONCE per direction per connection.
   A second LZ4D shipment on the same direction: close the connection.
 - Dictionary shipments are consumed by the transport layer; they
   MUST NOT be delivered to the application.
 
-### 6.3 Sender dictionary scope
+### 7.3 Sender dictionary scope
 
 The dictionary is a byte string, not a streaming compression context.
 Implementations MAY choose its ownership scope. It can be configured per
 socket, trained per socket, trained per fan-out lane, or trained per
 connection.
 
-The wire requirement is narrower: before sending any LZ4B or LZ4M part
+The wire requirement is narrower: before sending any LZ4B, LZ4M, or LZ4A part
 that was compressed with dict `D` on a connection, the sender MUST have
 shipped `LZ4D | D` on that same direction of that same connection, and
 MUST NOT ship a second dictionary on that direction. If many connections
@@ -311,21 +379,21 @@ dictionary shipment per direction per connection:
   before that connection's next dict-compressed payload.
 - Connection that already received `D`: do not send `D` again.
 
-No-dictionary LZ4B/LZ4M is a valid subset of this transport.
+No-dictionary LZ4B/LZ4M/LZ4A is a valid subset of this transport.
 
-### 6.4 Receiver handling
+### 7.4 Receiver handling
 
-The receiver validates the shipment against Sec. 6.2 and installs the
-dict on the current connection's receive side. Subsequent LZ4B
-parts on that direction MUST be decoded against the installed dict.
+The receiver validates the shipment against Sec. 7.2 and installs the
+dict on the current connection's receive side. Subsequent compressed
+parts and arenas on that direction MUST use the installed dict.
 
-### 6.5 Size budget accounting
+### 7.5 Size budget accounting
 
 Dictionary shipments do NOT count against the receiver's
 `max_message_size` budget. They are transport overhead, not
 messages.
 
-### 6.6 Dict mismatch detection (not implemented)
+### 7.6 Dict mismatch detection (not implemented)
 
 LZ4 block format has no `Dict_ID` field and no built-in checksum.
 This specification does NOT define a dictionary-id carried in the
@@ -337,7 +405,7 @@ Applications that need mismatch detection MUST validate at the
 application layer (schema validation, payload checksum, etc.).
 This reflects LZ4's minimal-overhead design goal.
 
-### 6.7 Automatic dictionary training
+### 7.7 Automatic dictionary training
 
 A sender MAY train a dictionary automatically from early traffic.
 The training algorithm, trigger condition, and parameters are
@@ -345,9 +413,9 @@ implementation choices. The following wire-level constraints MUST be
 respected:
 
 - A trained dictionary MUST NOT exceed the maximum dictionary size
-  (Sec. 6.2: 8 KiB).
+  (Sec. 7.2: 8 KiB).
 - A sender MUST ship at most one dictionary per direction per
-  connection (Sec. 6.2).
+  connection (Sec. 7.2).
 - If training fails (the sample set was too small or too uniform),
   the sender MUST stay in no-dictionary mode for the rest of the
   socket's lifetime. It MUST NOT retry training.
@@ -367,7 +435,7 @@ choice. Applications MAY disable it or supply an out-of-band
 dictionary instead.
 
 
-## 7. Receiver Size Budget
+## 8. Receiver Size Budget
 
 The receiver MUST bound decompression by the socket's
 `max_message_size`. Implementations MUST apply the bound as a cap
@@ -386,11 +454,14 @@ possible:
 If the budget is exhausted, the connection closes.
 
 If `max_message_size` is not set (unlimited), no bound is enforced.
+Arena limits in Sec. 6.8 remain mandatory even with an unlimited message
+budget. A receiver's outer framer MUST allow the bounded arena envelope
+independently of its logical message limit.
 
 
-## 8. ZMTP Interaction
+## 9. ZMTP Interaction
 
-### 8.1 Greeting and handshake
+### 9.1 Greeting and handshake
 
 The ZMTP 3.1 greeting, READY exchange, and all command frames
 (SUBSCRIBE, PING, etc.) run over raw TCP, uncompressed. Only
@@ -399,23 +470,27 @@ compression-timing side channel during handshake (when per-peer
 identity and subscription data could leak) and keeps the plain-TCP
 contract of the handshake unchanged.
 
-### 8.2 Socket type compatibility
+### 9.2 Socket type compatibility
 
 All ZMTP 3.1 socket type combinations that work over plain `tcp://`
 work over `lz4+tcp://`, including draft types (CLIENT/SERVER,
 RADIO/DISH, etc.). The transport is orthogonal to routing.
 
-### 8.3 Peer requirement
+### 9.3 Peer requirement
 
 Both peers MUST use the `lz4+tcp://` scheme. A `tcp://` peer cannot
 talk to an `lz4+tcp://` peer. The handshake succeeds, but the
 first post-handshake part fails sentinel dispatch on the
 `lz4+tcp://` side and closes.
 
+Revision 2 receivers MUST support `LZ4A`. No revision negotiation or
+fallback to older peers is defined; both endpoints must support arenas
+when a sender uses them. Older draft receivers reject the new sentinel.
 
-## 9. Security Considerations
 
-### 9.1 CRIME / BREACH-style compression oracles
+## 10. Security Considerations
+
+### 10.1 CRIME / BREACH-style compression oracles
 
 Compression combined with encryption where an attacker controls
 part of the plaintext and observes the ciphertext size creates a
@@ -423,13 +498,13 @@ byte-by-byte oracle for the non-attacker-controlled portion. This
 class of attack applies to any compression-then-encryption
 transport, including `lz4+tcp://` used with CURVE.
 
-Applications that (a) run CURVE, and (b) concatenate attacker-
-controlled and secret data into a single compressed part SHOULD
-NOT use `lz4+tcp://`. Use `tcp://` with CURVE instead, or separate
-the attacker-controlled and secret data into different parts (the
-per-part boundary prevents cross-part dictionary sharing).
+An arena shares compression history across its messages and parts.
+Separating secrets and attacker-controlled data into different messages
+does not isolate them inside an arena. OMQ rejects compression combined
+with encrypted mechanisms; implementations supporting that combination
+MUST account for this oracle across the whole compression unit.
 
-### 9.2 Length side-channel
+### 10.2 Length side-channel
 
 Compressed part sizes leak structural information about the
 plaintext (entropy, repeating patterns) to a passive wire observer.
@@ -437,18 +512,18 @@ Applications that require length-independent confidentiality MUST
 pad at the application layer before compression, or use plain
 `tcp://`.
 
-### 9.3 Dictionary contents
+### 10.3 Dictionary contents
 
 A dictionary shipped on the wire is visible to any intermediary
 with access to the ciphertext stream (the shipment itself is the
 raw bytes, uncompressed). Do NOT use dictionaries that contain
 secrets. A dictionary is an optimization hint, not a secret.
 
-### 9.4 Decompression bombs
+### 10.4 Decompression bombs
 
 A malicious peer could craft an LZ4B or LZ4M part with a declared
 `decompressed_size` close to `usize::MAX`, causing the receiver to
-allocate a huge output buffer. The per-part size-budget check (Sec. 7)
+allocate a huge output buffer. The per-part size-budget check (Sec. 8)
 defends against this: the cap is applied to `decompressed_size`
 BEFORE the buffer is allocated. Operators SHOULD set a sensible
 `max_message_size` on every `lz4+tcp://` socket; the default
@@ -456,7 +531,7 @@ unlimited policy is appropriate only when the application fully
 trusts its peers.
 
 For LZ4B, `decompressed_size` is additionally capped at
-`LZ4M_BLOCK_SIZE` (1 GiB) by the receiver (Sec. 5.7 rule 3). Parts
+`LZ4M_BLOCK_SIZE` (1 GiB) by the receiver (Sec. 6.7 rule 3). Parts
 larger than this MUST use LZ4M, where the total allocation is
 still governed by the declared `decompressed_size` and the budget.
 
@@ -466,7 +541,7 @@ is bounded by the spec at roughly 255x, still large enough that
 an unbounded budget is not safe on untrusted peers.
 
 
-## 10. Constants
+## 11. Constants
 
 | Constant                      | Value                                    |
 |-------------------------------|------------------------------------------|
@@ -475,6 +550,10 @@ an unbounded budget is not safe on untrusted peers.
 | Single-block sentinel         | `4C 5A 34 42` (`LZ4B`)                   |
 | Multi-block sentinel          | `4C 5A 34 4D` (`LZ4M`)                   |
 | Dictionary sentinel           | `4C 5A 34 44` (`LZ4D`)                   |
+| Arena sentinel                | `4C 5A 34 41` (`LZ4A`)                   |
+| Arena envelope                | 16 bytes                                 |
+| Maximum decoded arena         | 65536 bytes                              |
+| Maximum arena messages/parts  | 256 / 4096                               |
 | LZ4M block size               | 1,073,741,824 (1 GiB, `0x40000000`)      |
 | Max dictionary size           | 8192 bytes                               |
 | Min compress size, no dict    | 512 bytes (RECOMMENDED)                  |
@@ -486,7 +565,7 @@ an unbounded budget is not safe on untrusted peers.
 | LZ4D envelope size            | 4 bytes (sentinel)                       |
 
 
-## 11. References
+## 12. References
 
 - [LZ4 Block Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md)
 - [RFC 37/ZMTP 3.1](https://rfc.zeromq.org/spec/37/)
